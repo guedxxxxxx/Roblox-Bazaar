@@ -32,9 +32,10 @@ const SERVER_ID = '1395915214582714418';
 const BUYER_ROLE_ID = '1396976275964432454';
 const OWNER_ROLE_ID = '1395915214582714422';
 const MODERATOR_ROLE_ID = '1395915214582714420'; // Former server manager role
-const TICKET_CREATION_CHANNEL_ID = '1395915215027306523';
+const TICKET_CREATION_CHANNEL_ID = '1395915215027306521';
 const VOUCH_CHANNEL_ID = '1396973300474712225';
 const SPENDING_LOG_CHANNEL_ID = '1396973366157512855';
+const CUSTOM_PRODUCTS_LOG_CHANNEL_ID = '1398157780266913822'; // Custom products log channel
 
 // Thread channel IDs for category redirects
 const THREAD_CHANNELS = {
@@ -351,8 +352,18 @@ const ACCOUNTS_PRODUCTS = {
   }
 };
 
-// User shopping carts
-let userCarts = new Map();
+// User shopping carts - separate carts for each category
+let userCarts = new Map(); // userId -> { grow_garden: [], steal_brainrot: [], accounts: [] }
+
+// Custom products storage
+let customProducts = {
+  'grow_garden': {},
+  'steal_brainrot': {},
+  'accounts': {}
+};
+
+// Product creation sessions
+let productCreationSessions = new Map();
 
 let userTickets = new Map();
 let userSpending = new Map();
@@ -361,6 +372,19 @@ let userSpending = new Map();
 function hasAdminPermissions(userId, member) {
   return userId === OWNER_ROLE_ID || 
          (member && (member.roles.cache.has(MODERATOR_ROLE_ID) || member.roles.cache.has(OWNER_ROLE_ID)));
+}
+
+// Get step number for product creation
+function getStepNumber(step) {
+  const steps = {
+    'gamepass_link': 1,
+    'product_name': 2,
+    'product_emoji': 3,
+    'price_usd': 4,
+    'price_robux': 5,
+    'category': 6
+  };
+  return steps[step] || 0;
 }
 
 // Count user's active tickets
@@ -463,6 +487,178 @@ async function updateSpendingLog(userId, totalUSD, totalRobux) {
 client.on(Events.MessageCreate, async message => {
   if (message.author.bot) return;
   if (!message.guild) return;
+
+  // Handle product creation sessions
+  if (productCreationSessions.has(message.author.id)) {
+      const session = productCreationSessions.get(message.author.id);
+
+      // Check if message is in the same channel as the session
+      if (session.channelId !== message.channel.id) {
+          return; // Ignore messages from other channels
+      }
+
+      // Handle cancel command
+      if (message.content.toLowerCase() === 'cancel') {
+          productCreationSessions.delete(message.author.id);
+          return message.reply('❌ Product creation cancelled.');
+      }
+
+      const member = message.guild.members.cache.get(message.author.id);
+      if (!hasAdminPermissions(message.author.id, member)) {
+          productCreationSessions.delete(message.author.id);
+          return message.reply('❌ Permission denied. Session cancelled.');
+      }
+
+      // Process the current step
+      const content = message.content.trim();
+      let nextStep = null;
+      let promptMessage = '';
+
+      switch (session.step) {
+          case 'gamepass_link':
+              if (!content.includes('roblox.com/game-pass/')) {
+                  return message.reply('❌ Please provide a valid Roblox gamepass link! Example: https://www.roblox.com/game-pass/123456/cool-pet');
+              }
+              session.data.gamepass = content;
+              nextStep = 'product_name';
+              promptMessage = 'Great! Now please provide the **Product Name**.';
+              break;
+
+          case 'product_name':
+              if (content.length < 2 || content.length > 50) {
+                  return message.reply('❌ Product name must be between 2 and 50 characters!');
+              }
+              session.data.name = content;
+              nextStep = 'product_emoji';
+              promptMessage = 'Perfect! Now please provide an **Emoji** for this product (like 🐸 or 🌟).';
+              break;
+
+          case 'product_emoji':
+              session.data.emoji = content;
+              nextStep = 'price_usd';
+              promptMessage = 'Nice! Now please provide the **Price in USD** (numbers only, like 5.50).';
+              break;
+
+          case 'price_usd':
+              const priceUsd = parseFloat(content.replace(/[^\d.-]/g, ''));
+              if (isNaN(priceUsd) || priceUsd < 0) {
+                  return message.reply('❌ Please provide a valid USD price! Example: 5.50');
+              }
+              session.data.price_usd = priceUsd;
+              nextStep = 'price_robux';
+              promptMessage = 'Excellent! Now please provide the **Price in Robux** (numbers only, like 1200).';
+              break;
+
+          case 'price_robux':
+              const priceRobux = parseInt(content.replace(/[^\d]/g, ''));
+              if (isNaN(priceRobux) || priceRobux < 0) {
+                  return message.reply('❌ Please provide a valid Robux price! Example: 1200');
+              }
+              session.data.price_robux = priceRobux;
+              nextStep = 'category';
+              promptMessage = 'Almost done! Now please provide the **Category** (grow_garden, steal_brainrot, or accounts).';
+              break;
+
+          case 'category':
+              const category = content.toLowerCase();
+              if (!['grow_garden', 'steal_brainrot', 'accounts'].includes(category)) {
+                  return message.reply('❌ Invalid category! Please use: grow_garden, steal_brainrot, or accounts');
+              }
+              session.data.category = category;
+
+              // Complete the product creation
+              try {
+                  const logChannel = client.channels.cache.get(CUSTOM_PRODUCTS_LOG_CHANNEL_ID);
+                  if (!logChannel) {
+                      productCreationSessions.delete(message.author.id);
+                      return message.reply('❌ Custom products log channel not found!');
+                  }
+
+                  // Create unique key for the product
+                  const productKey = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+                  const newProduct = {
+                      name: session.data.name,
+                      emoji: session.data.emoji,
+                      price_usd: session.data.price_usd,
+                      price_robux: session.data.price_robux,
+                      gamepass: session.data.gamepass,
+                      custom: true
+                  };
+
+                  // Add to custom products storage
+                  customProducts[session.data.category][productKey] = newProduct;
+
+                  // Log the new product
+                  const logEmbed = new EmbedBuilder()
+                      .setTitle('✅ New Custom Product Added')
+                      .addFields(
+                          { name: 'Product Name', value: session.data.name, inline: true },
+                          { name: 'Category', value: session.data.category, inline: true },
+                          { name: 'Emoji', value: session.data.emoji, inline: true },
+                          { name: 'Price USD', value: `$${session.data.price_usd.toFixed(2)}`, inline: true },
+                          { name: 'Price Robux', value: `${session.data.price_robux.toLocaleString()}`, inline: true },
+                          { name: 'Gamepass Link', value: session.data.gamepass, inline: false },
+                          { name: 'Product ID', value: productKey, inline: false }
+                      )
+                      .setColor(BLUE_COLOR)
+                      .setFooter({ text: `Added by ${message.author.username}` })
+                      .setTimestamp();
+
+                  // Add copy button for the product ID
+                  const copyButton = new ButtonBuilder()
+                      .setCustomId(`copy_product_id_${productKey}`)
+                      .setLabel('Copy Product ID')
+                      .setStyle(ButtonStyle.Secondary)
+                      .setEmoji('📋');
+
+                  const copyRow = new ActionRowBuilder().addComponents(copyButton);
+
+                  const logMessage = await logChannel.send({ embeds: [logEmbed], components: [copyRow] });
+
+                  // Update thread with new product
+                  await updateThreadWithCustomProducts(session.data.category);
+
+                  // Success message with thread link
+                  const successEmbed = new EmbedBuilder()
+                      .setTitle('🎉 Product Created Successfully!')
+                      .setDescription(`**${session.data.name}** has been added to **${session.data.category}**!`)
+                      .addFields(
+                          { name: '📝 Details', value: `${session.data.emoji} **${session.data.name}**\n$${session.data.price_usd.toFixed(2)} USD | ${session.data.price_robux.toLocaleString()} Robux`, inline: false },
+                          { name: '🔗 Product created at', value: `[View Log Message](${logMessage.url})`, inline: false }
+                      )
+                      .setColor(BLUE_COLOR)
+                      .setTimestamp();
+
+                  await message.reply({ embeds: [successEmbed] });
+
+                  // Clean up session
+                  productCreationSessions.delete(message.author.id);
+                  return;
+
+              } catch (error) {
+                  console.error('Error creating product:', error);
+                  productCreationSessions.delete(message.author.id);
+                  return message.reply('❌ An error occurred while creating the product. Please try again.');
+              }
+      }
+
+      // Update session and send next prompt
+      if (nextStep) {
+          session.step = nextStep;
+          productCreationSessions.set(message.author.id, session);
+
+          const promptEmbed = new EmbedBuilder()
+              .setTitle('🛠️ Product Creation - Step ' + getStepNumber(nextStep) + '/6')
+              .setDescription(promptMessage)
+              .setColor(BLUE_COLOR)
+              .setFooter({ text: 'Type "cancel" to cancel this process' });
+
+          await message.reply({ embeds: [promptEmbed] });
+      }
+
+      return; // Don't process other commands during product creation
+  }
 
   if (message.content.toLowerCase() === '!market') {
     const member = message.guild.members.cache.get(message.author.id);
@@ -767,54 +963,41 @@ client.on(Events.MessageCreate, async message => {
     await message.reply({ embeds: [resultEmbed] });
   }
 
-  // Command to add a product
-  if (message.content.toLowerCase().startsWith('!addproduct')) {
+  // Command to add a product - step-by-step form
+  if (message.content.toLowerCase() === '!addproduct') {
       const member = message.guild.members.cache.get(message.author.id);
 
       if (!hasAdminPermissions(message.author.id, member)) {
           return message.reply('❌ Only authorized staff can use this command!');
       }
 
-      const args = message.content.split(' ');
-      if (args.length !== 7) {
-          return message.reply('❌ Usage: !addproduct (gamepass link) (product name) (product class like steal a brainrot or grow a garden) (price usd) (price robux) (emoji)');
+      // Check if user already has an active session
+      if (productCreationSessions.has(message.author.id)) {
+          return message.reply('❌ You already have an active product creation session! Please complete it first or type `cancel` to cancel it.');
       }
 
-      const gamepassLink = args[1];
-      const productName = args[2];
-      const productClass = args[3];
-      const priceUsd = parseFloat(args[4]);
-      const priceRobux = parseInt(args[5]);
-      const emoji = args[6];
+      // Start new product creation session
+      productCreationSessions.set(message.author.id, {
+          step: 'gamepass_link',
+          data: {},
+          channelId: message.channel.id
+      });
 
-      if (isNaN(priceUsd) || isNaN(priceRobux)) {
-          return message.reply('❌ Price USD and Price Robux must be valid numbers!');
-      }
+      const startEmbed = new EmbedBuilder()
+          .setTitle('🛠️ Product Creation Started')
+          .setDescription('Please provide the **Gamepass Link** for the new product.')
+          .addFields({
+              name: 'Example',
+              value: 'https://www.roblox.com/game-pass/123456/cool-pet',
+              inline: false
+          })
+          .setColor(BLUE_COLOR)
+          .setFooter({ text: 'Type "cancel" at any time to cancel this process' });
 
-      if (!BAZAAR_CATEGORIES[productClass]) {
-          return message.reply('❌ Invalid product class! Available classes: steal_brainrot, grow_garden, accounts');
-      }
-
-      const logChannel = client.channels.cache.get(SPENDING_LOG_CHANNEL_ID); // Or another appropriate log channel
-      if (!logChannel) {
-          return message.reply('❌ Logging channel not found!');
-      }
-
-      const newProduct = {
-          name: productName,
-          emoji: emoji,
-          price_usd: priceUsd,
-          price_robux: priceRobux,
-          gamepass: gamepassLink
-      };
-
-      // Log the new product
-      logChannel.send(`New product added:\nName: ${productName}\nClass: ${productClass}\nUSD: ${priceUsd}\nRobux: ${priceRobux}\nGamepass: ${gamepassLink}\nEmoji: ${emoji}`);
-
-      message.reply(`✅ Product "${productName}" added to "${productClass}"!`);
+      return message.reply({ embeds: [startEmbed] });
   }
 
-  // Command to remove a product
+  // Command to remove a product - improved with log deletion
   if (message.content.toLowerCase().startsWith('!removeproduct')) {
       const member = message.guild.members.cache.get(message.author.id);
 
@@ -823,30 +1006,128 @@ client.on(Events.MessageCreate, async message => {
       }
 
       const args = message.content.split(' ');
-      if (args.length !== 3) {
-          return message.reply('❌ Usage: !removeproduct (product name) (product class)');
+      if (args.length < 2) {
+          // Show available products to remove
+          const allCustomProducts = [];
+          for (const [category, products] of Object.entries(customProducts)) {
+              for (const [key, product] of Object.entries(products)) {
+                  allCustomProducts.push({
+                      category: category,
+                      key: key,
+                      name: product.name,
+                      emoji: product.emoji
+                  });
+              }
+          }
+
+          if (allCustomProducts.length === 0) {
+              return message.reply('❌ No custom products found to remove!');
+          }
+
+          let productList = '**Available Products to Remove:**\n\n';
+          allCustomProducts.forEach((product, index) => {
+              productList += `${index + 1}. ${product.emoji} **${product.name}** (${product.category})\n`;
+              productList += `   Use: \`!removeproduct ${product.key}\`\n\n`;
+          });
+
+          const listEmbed = new EmbedBuilder()
+              .setTitle('🗑️ Remove Custom Product')
+              .setDescription(productList)
+              .setColor(BLUE_COLOR)
+              .setFooter({ text: 'Use !removeproduct <product_id> to remove a specific product' });
+
+          return message.reply({ embeds: [listEmbed] });
       }
 
-      const productName = args[1];
-      const productClass = args[2];
+      const productKey = args[1];
+      let foundProduct = null;
+      let foundCategory = null;
 
-      if (!BAZAAR_CATEGORIES[productClass]) {
-          return message.reply('❌ Invalid product class! Available classes: steal_brainrot, grow_garden, accounts');
+      // Find the product
+      for (const [category, products] of Object.entries(customProducts)) {
+          if (products[productKey]) {
+              foundProduct = products[productKey];
+              foundCategory = category;
+              break;
+          }
       }
 
-      const logChannel = client.channels.cache.get(SPENDING_LOG_CHANNEL_ID); // Or another appropriate log channel
-      if (!logChannel) {
-          return message.reply('❌ Logging channel not found!');
+      if (!foundProduct) {
+          return message.reply('❌ Product not found! Use `!removeproduct` to see available products.');
       }
 
-      // Log the product removal
-      logChannel.send(`Product "${productName}" removed from "${productClass}".`);
+      // Remove from storage
+      delete customProducts[foundCategory][productKey];
 
-      message.reply(`✅ Product "${productName}" removed from "${productClass}"!`);
+      // Find and delete the log message
+      const logChannel = client.channels.cache.get(CUSTOM_PRODUCTS_LOG_CHANNEL_ID);
+      let logDeleted = false;
+
+      if (logChannel) {
+          try {
+              let lastMessageId = null;
+              let searchCount = 0;
+              const maxSearches = 10;
+
+              while (searchCount < maxSearches && !logDeleted) {
+                  const fetchOptions = { limit: 100 };
+                  if (lastMessageId) {
+                      fetchOptions.before = lastMessageId;
+                  }
+
+                  const messages = await logChannel.messages.fetch(fetchOptions);
+                  if (messages.size === 0) break;
+
+                  for (const [messageId, msg] of messages) {
+                      if (msg.author.id === client.user.id && 
+                          msg.embeds.length > 0 && 
+                          msg.embeds[0].fields) {
+
+                          const productIdField = msg.embeds[0].fields.find(field => 
+                              field.name === 'Product ID' && field.value === productKey
+                          );
+
+                          if (productIdField) {
+                              await msg.delete();
+                              logDeleted = true;
+                              console.log(`🗑️ Deleted log message for product ${productKey}`);
+                              break;
+                          }
+                      }
+                  }
+
+                  if (!logDeleted) {
+                      lastMessageId = messages.last().id;
+                      searchCount++;
+                  }
+
+                  if (messages.size < 100) break;
+              }
+          } catch (error) {
+              console.error('Error deleting log message:', error);
+          }
+      }
+
+      // Update thread
+      await updateThreadWithCustomProducts(foundCategory);
+
+      const successEmbed = new EmbedBuilder()
+          .setTitle('✅ Product Removed Successfully')
+          .setDescription(`**${foundProduct.name}** has been removed from **${foundCategory}**.`)
+          .addFields(
+              { name: '📝 Log Status', value: logDeleted ? '✅ Log message deleted' : '⚠️ Log message not found', inline: true },
+              { name: '🧵 Thread Status', value: '✅ Thread updated', inline: true }
+          )
+          .setColor(BLUE_COLOR)
+          .setFooter({ text: `Removed by ${message.author.username}` })
+          .setTimestamp();
+
+      await message.reply({ embeds: [successEmbed] });
   }
 });
 
 client.on(Events.InteractionCreate, async interaction => {
+
   if (interaction.isStringSelectMenu()) {
     if (interaction.customId === 'select_accounts_product') {
       const userId = interaction.user.id;
@@ -857,9 +1138,14 @@ client.on(Events.InteractionCreate, async interaction => {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
       }
 
-      // Add product to user's cart
-      let userCart = userCarts.get(userId) || [];
-      userCart.push({
+      // Initialize user carts if needed
+      if (!userCarts.has(userId)) {
+        userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+      }
+
+      // Add product to user's accounts cart
+      const userCartData = userCarts.get(userId);
+      userCartData.accounts.push({
         key: selectedProduct,
         name: product.name,
         emoji: product.emoji,
@@ -867,20 +1153,21 @@ client.on(Events.InteractionCreate, async interaction => {
         price_robux: product.price_robux,
         gamepass: product.gamepass
       });
-      userCarts.set(userId, userCart);
+      userCarts.set(userId, userCartData);
 
-      // Calculate cart totals
-      const totalUSD = userCart.reduce((sum, item) => sum + item.price_usd, 0);
-      const totalRobux = userCart.reduce((sum, item) => sum + item.price_robux, 0);
+      // Calculate cart totals for accounts category only
+      const accountsCart = userCartData.accounts;
+      const totalUSD = accountsCart.reduce((sum, item) => sum + item.price_usd, 0);
+      const totalRobux = accountsCart.reduce((sum, item) => sum + item.price_robux, 0);
 
       // Create cart display
       let cartDisplay = '';
-      userCart.forEach((item, index) => {
+      accountsCart.forEach((item, index) => {
         cartDisplay += `${index + 1}. ${item.emoji} **${item.name}** - $${item.price_usd} | ${item.price_robux} Robux\n   [Gamepass Link](${item.gamepass})\n`;
       });
 
       const cartEmbed = new EmbedBuilder()
-        .setTitle('🛒 Your Shopping Cart')
+        .setTitle('🛒 Your Accounts Shopping Cart')
         .setDescription(cartDisplay || 'Your cart is empty')
         .addFields(
           { name: '💰 Total', value: `$${totalUSD.toFixed(2)} USD | ${totalRobux.toLocaleString()} Robux`, inline: false }
@@ -921,9 +1208,14 @@ client.on(Events.InteractionCreate, async interaction => {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
       }
 
-      // Add product to user's cart
-      let userCart = userCarts.get(userId) || [];
-      userCart.push({
+      // Initialize user carts if needed
+      if (!userCarts.has(userId)) {
+        userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+      }
+
+      // Add product to user's steal_brainrot cart
+      const userCartData = userCarts.get(userId);
+      userCartData.steal_brainrot.push({
         key: selectedProduct,
         name: product.name,
         emoji: product.emoji,
@@ -931,20 +1223,21 @@ client.on(Events.InteractionCreate, async interaction => {
         price_robux: product.price_robux,
         gamepass: product.gamepass
       });
-      userCarts.set(userId, userCart);
+      userCarts.set(userId, userCartData);
 
-      // Calculate cart totals
-      const totalUSD = userCart.reduce((sum, item) => sum + item.price_usd, 0);
-      const totalRobux = userCart.reduce((sum, item) => sum + item.price_robux, 0);
+      // Calculate cart totals for steal_brainrot category only
+      const stealBrainrotCart = userCartData.steal_brainrot;
+      const totalUSD = stealBrainrotCart.reduce((sum, item) => sum + item.price_usd, 0);
+      const totalRobux = stealBrainrotCart.reduce((sum, item) => sum + item.price_robux, 0);
 
       // Create cart display
       let cartDisplay = '';
-      userCart.forEach((item, index) => {
+      stealBrainrotCart.forEach((item, index) => {
         cartDisplay += `${index + 1}. ${item.emoji} **${item.name}** - $${item.price_usd} | ${item.price_robux} Robux\n   [Gamepass Link](${item.gamepass})\n`;
       });
 
       const cartEmbed = new EmbedBuilder()
-        .setTitle('🛒 Your Shopping Cart')
+        .setTitle('🛒 Your Steal a Brainrot Shopping Cart')
         .setDescription(cartDisplay || 'Your cart is empty')
         .addFields(
           { name: '💰 Total', value: `$${totalUSD.toFixed(2)} USD | ${totalRobux.toLocaleString()} Robux`, inline: false }
@@ -985,9 +1278,14 @@ client.on(Events.InteractionCreate, async interaction => {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
       }
 
-      // Add product to user's cart
-      let userCart = userCarts.get(userId) || [];
-      userCart.push({
+      // Initialize user carts if needed
+      if (!userCarts.has(userId)) {
+        userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+      }
+
+      // Add product to user's grow_garden cart
+      const userCartData = userCarts.get(userId);
+      userCartData.grow_garden.push({
         key: selectedProduct,
         name: product.name,
         emoji: product.emoji,
@@ -995,20 +1293,21 @@ client.on(Events.InteractionCreate, async interaction => {
         price_robux: product.price_robux,
         gamepass: product.gamepass
       });
-      userCarts.set(userId, userCart);
+      userCarts.set(userId, userCartData);
 
-      // Calculate cart totals
-      const totalUSD = userCart.reduce((sum, item) => sum + item.price_usd, 0);
-      const totalRobux = userCart.reduce((sum, item) => sum + item.price_robux, 0);
+      // Calculate cart totals for grow_garden category only
+      const growGardenCart = userCartData.grow_garden;
+      const totalUSD = growGardenCart.reduce((sum, item) => sum + item.price_usd, 0);
+      const totalRobux = growGardenCart.reduce((sum, item) => sum + item.price_robux, 0);
 
       // Create cart display
       let cartDisplay = '';
-      userCart.forEach((item, index) => {
+      growGardenCart.forEach((item, index) => {
         cartDisplay += `${index + 1}. ${item.emoji} **${item.name}** - $${item.price_usd} | ${item.price_robux} Robux\n   [Gamepass Link](${item.gamepass})\n`;
       });
 
       const cartEmbed = new EmbedBuilder()
-        .setTitle('🛒 Your Shopping Cart')
+        .setTitle('🛒 Your Grow a Garden Shopping Cart')
         .setDescription(cartDisplay || 'Your cart is empty')
         .addFields(
           { name: '💰 Total', value: `$${totalUSD.toFixed(2)} USD | ${totalRobux.toLocaleString()} Robux`, inline: false }
@@ -1069,8 +1368,10 @@ client.on(Events.InteractionCreate, async interaction => {
       if (category === 'grow_garden') {
         const userId = interaction.user.id;
 
-        // Initialize empty cart for user
-        userCarts.set(userId, []);
+        // Initialize category-specific cart for user
+        if (!userCarts.has(userId)) {
+          userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+        }
 
         const productEmbed = new EmbedBuilder()
           .setTitle('🌱 Grow a Garden - Product Selection')
@@ -1109,8 +1410,10 @@ client.on(Events.InteractionCreate, async interaction => {
       if (category === 'accounts') {
         const userId = interaction.user.id;
 
-        // Initialize empty cart for user
-        userCarts.set(userId, []);
+        // Initialize category-specific cart for user
+        if (!userCarts.has(userId)) {
+          userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+        }
 
         const productEmbed = new EmbedBuilder()
           .setTitle('👤 Accounts - Product Selection')
@@ -1149,8 +1452,10 @@ client.on(Events.InteractionCreate, async interaction => {
       if (category === 'steal_brainrot') {
         const userId = interaction.user.id;
 
-        // Initialize empty cart for user
-        userCarts.set(userId, []);
+        // Initialize category-specific cart for user
+        if (!userCarts.has(userId)) {
+          userCarts.set(userId, { grow_garden: [], steal_brainrot: [], accounts: [] });
+        }
 
         const productEmbed = new EmbedBuilder()
           .setTitle('🧠 Steal a Brainrot - Product Selection')
@@ -1198,7 +1503,14 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       const guild = interaction.guild;
-      const mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+      let mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+
+      // Fallback to finding channel by name if ID doesn't work
+      if (!mainChannel) {
+        mainChannel = guild.channels.cache.find(channel => 
+          channel.name === '〘🛒〙𝗦𝗛𝗢𝗣' || channel.name.includes('SHOP')
+        );
+      }
 
       if (!mainChannel) {
         return interaction.reply({ content: '❌ Ticket channel not found!', flags: 64 });
@@ -1580,6 +1892,12 @@ client.on(Events.InteractionCreate, async interaction => {
         content: `📋 **PayPal:** \`${PAYPAL_EMAIL}\`\n\nClick to select and copy the email above.`, 
         flags: 64 
       });
+    } else if (interaction.customId.startsWith('copy_product_id_')) {
+      const productId = interaction.customId.replace('copy_product_id_', '');
+      await interaction.reply({ 
+        content: `📋 **Product ID:** \`${productId}\`\n\nUse this with: \`!removeproduct ${productId}\``, 
+        flags: 64 
+      });
     } else if (interaction.customId === 'continue_shopping_grow_garden') {
       const productEmbed = new EmbedBuilder()
         .setTitle('🌱 Grow a Garden - Product Selection')
@@ -1610,7 +1928,8 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     } else if (interaction.customId === 'create_grow_garden_ticket') {
       const userId = interaction.user.id;
-      const userCart = userCarts.get(userId) || [];
+      const userCartData = userCarts.get(userId);
+      const userCart = userCartData ? userCartData.grow_garden : [];
 
       if (userCart.length === 0) {
         return interaction.reply({ content: '❌ Your cart is empty! Please select some products first.', flags: 64 });
@@ -1665,14 +1984,22 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     } else if (interaction.customId === 'confirm_create_grow_garden_ticket') {
       const userId = interaction.user.id;
-      const userCart = userCarts.get(userId) || [];
+      const userCartData = userCarts.get(userId);
+      const userCart = userCartData ? userCartData.grow_garden : [];
 
       if (userCart.length === 0) {
         return interaction.reply({ content: '❌ Your cart is empty!', flags: 64 });
       }
 
       const guild = interaction.guild;
-      const mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+      let mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+
+      // Fallback to finding channel by name if ID doesn't work
+      if (!mainChannel) {
+        mainChannel = guild.channels.cache.find(channel => 
+          channel.name === '〘🛒〙𝗦𝗛𝗢𝗣' || channel.name.includes('SHOP')
+        );
+      }
 
       if (!mainChannel) {
         return interaction.reply({ content: '❌ Ticket channel not found!', flags: 64 });
@@ -1755,8 +2082,11 @@ client.on(Events.InteractionCreate, async interaction => {
         components: [utilityRow, paymentRow] 
       });
 
-      // Clear user's cart after ticket creation
-      userCarts.delete(userId);
+      // Clear only the grow_garden cart after ticket creation
+      if (userCartData) {
+        userCartData.grow_garden = [];
+        userCarts.set(userId, userCartData);
+      }
 
       await interaction.update({ 
         content: `✅ Grow a Garden ticket created! <#${thread.id}>`, 
@@ -1767,7 +2097,8 @@ client.on(Events.InteractionCreate, async interaction => {
       saveDatabase();
     } else if (interaction.customId === 'cancel_create_ticket') {
       const userId = interaction.user.id;
-      const userCart = userCarts.get(userId) || [];
+      const userCartData = userCarts.get(userId);
+      const userCart = userCartData ? userCartData.grow_garden : [];
 
       // Show cart again
       const totalUSD = userCart.reduce((sum, item) => sum + item.price_usd, 0);
@@ -1812,7 +2143,11 @@ client.on(Events.InteractionCreate, async interaction => {
       });
     } else if (interaction.customId === 'clear_cart_grow_garden') {
       const userId = interaction.user.id;
-      userCarts.delete(userId);
+      const userCartData = userCarts.get(userId);
+      if (userCartData) {
+        userCartData.grow_garden = [];
+        userCarts.set(userId, userCartData);
+      }
 
       const productEmbed = new EmbedBuilder()
         .setTitle('🌱 Grow a Garden - Product Selection')
@@ -1933,7 +2268,14 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       const guild = interaction.guild;
-      const mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+      let mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+
+      // Fallback to finding channel by name if ID doesn't work
+      if (!mainChannel) {
+        mainChannel = guild.channels.cache.find(channel => 
+          channel.name === '〘🛒〙𝗦𝗛𝗢𝗣' || channel.name.includes('SHOP')
+        );
+      }
 
       if (!mainChannel) {
         return interaction.reply({ content: '❌ Ticket channel not found!', flags: 64 });
@@ -2163,7 +2505,14 @@ client.on(Events.InteractionCreate, async interaction => {
       }
 
       const guild = interaction.guild;
-      const mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+      let mainChannel = guild.channels.cache.get(TICKET_CREATION_CHANNEL_ID);
+
+      // Fallback to finding channel by name if ID doesn't work
+      if (!mainChannel) {
+        mainChannel = guild.channels.cache.find(channel => 
+          channel.name === '〘🛒〙𝗦𝗛𝗢𝗣' || channel.name.includes('SHOP')
+        );
+      }
 
       if (!mainChannel) {
         return interaction.reply({ content: '❌ Ticket channel not found!', flags: 64 });
@@ -2372,6 +2721,7 @@ client.login(process.env.TOKEN);
 client.once('ready', async () => {
   console.log(`🎮 Roblox Bazaar Bot is ready! Logged in as ${client.user.tag}!`);
   loadDatabase();
+  await loadCustomProductsFromLogs();
 
   // Clean up archived tickets
   const ticketChannelId = TICKET_CREATION_CHANNEL_ID;
@@ -2416,14 +2766,124 @@ client.once('ready', async () => {
 });
 
 function getAllProductsForCategory(category) {
+    let baseProducts = {};
     switch (category) {
         case 'grow_garden':
-            return GROW_GARDEN_PRODUCTS;
+            baseProducts = { ...GROW_GARDEN_PRODUCTS };
+            break;
         case 'steal_brainrot':
-            return STEAL_BRAINROT_PRODUCTS;
+            baseProducts = { ...STEAL_BRAINROT_PRODUCTS };
+            break;
         case 'accounts':
-            return ACCOUNTS_PRODUCTS;
+            baseProducts = { ...ACCOUNTS_PRODUCTS };
+            break;
         default:
             return {};
+    }
+
+    // Add custom products
+    if (customProducts[category]) {
+        baseProducts = { ...baseProducts, ...customProducts[category] };
+    }
+
+    return baseProducts;
+}
+
+// Function to update thread with custom products
+async function updateThreadWithCustomProducts(category) {
+    const threadId = THREAD_CHANNELS[category];
+    if (!threadId) return;
+
+    const thread = client.channels.cache.get(threadId);
+    if (!thread) return;
+
+    // Get custom products for this category
+    const customProds = customProducts[category] || {};
+    
+    // Start with the base thread message
+    let threadMessage = THREAD_MESSAGES[category] || '';
+
+    // Create custom products section
+    if (Object.keys(customProds).length > 0) {
+        let customSection = '\n\n## __CUSTOM PRODUCTS__\n';
+        Object.values(customProds).forEach(product => {
+            customSection += `> ### - <a:arrow:1396727506970611762> ${product.emoji} ${product.name} = $${product.price_usd} | ${product.price_robux} robux\n`;
+        });
+        threadMessage += customSection;
+    }
+
+    // Edit the main thread message (the one with the products list)
+    try {
+        const messages = await thread.messages.fetch({ limit: 10 });
+        let mainBotMessage = null;
+
+        // Find the main bot message (the one that contains the product list, not the buy button message)
+        for (const [messageId, message] of messages) {
+            if (message.author.id === client.user.id && 
+                message.content.includes('VALUED PETS') || 
+                message.content.includes('SECRETS') || 
+                message.content.includes('ACCOUNTS')) {
+                mainBotMessage = message;
+                break;
+            }
+        }
+
+        if (mainBotMessage) {
+            await mainBotMessage.edit(threadMessage);
+            console.log(`✅ Updated thread ${category} with custom products`);
+        } else {
+            // If no main message found, send a new one
+            await thread.send(threadMessage);
+            console.log(`✅ Created new message in thread ${category} with custom products`);
+        }
+    } catch (error) {
+        console.error('Error updating thread with custom products:', error);
+    }
+}
+
+// Function to load custom products from log channel on startup
+async function loadCustomProductsFromLogs() {
+    const logChannel = client.channels.cache.get(CUSTOM_PRODUCTS_LOG_CHANNEL_ID);
+    if (!logChannel) return;
+
+    try {
+        const messages = await logChannel.messages.fetch({ limit: 100 });
+
+        for (const [messageId, message] of messages) {
+            if (message.author.id === client.user.id && 
+                message.embeds.length > 0 && 
+                message.embeds[0].title === '✅ New Custom Product Added') {
+
+                const embed = message.embeds[0];
+                const fields = embed.fields;
+
+                const productName = fields.find(f => f.name === 'Product Name')?.value;
+                const category = fields.find(f => f.name === 'Category')?.value;
+                const emoji = fields.find(f => f.name === 'Emoji')?.value;
+                const priceUsd = parseFloat(fields.find(f => f.name === 'Price USD')?.value.replace('$', ''));
+                const priceRobux = parseInt(fields.find(f => f.name === 'Price Robux')?.value.replace(/,/g, ''));
+                const gamepassLink = fields.find(f => f.name === 'Gamepass Link')?.value;
+                const productKey = fields.find(f => f.name === 'Product ID')?.value;
+
+                if (productName && category && productKey) {
+                    if (!customProducts[category]) {
+                        customProducts[category] = {};
+                    }
+
+                    customProducts[category][productKey] = {
+                        name: productName,
+                        emoji: emoji,
+                        price_usd: priceUsd,
+                        price_robux: priceRobux,
+                        gamepass: gamepassLink,
+                        custom: true
+                    };
+                }
+            }
+        }
+
+        console.log('✅ Loaded custom products from logs');
+    } catch (error) {
+        console.error('Error loading custom products:', error);
     }
 }
