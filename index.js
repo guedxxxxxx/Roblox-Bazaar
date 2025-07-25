@@ -32,7 +32,7 @@ const SERVER_ID = '1395915214582714418';
 const BUYER_ROLE_ID = '1396976275964432454';
 const OWNER_ROLE_ID = '1395915214582714422';
 const MODERATOR_ROLE_ID = '1395915214582714420'; // Former server manager role
-const TICKET_CREATION_CHANNEL_ID = '1395915215027306521';
+const TICKET_CREATION_CHANNEL_ID = '1395915215027306523';
 const VOUCH_CHANNEL_ID = '1396973300474712225';
 const SPENDING_LOG_CHANNEL_ID = '1396973366157512855';
 
@@ -734,7 +734,7 @@ client.on(Events.MessageCreate, async message => {
 
         // Send new message
         await threadChannel.send(messageContent);
-        
+
         // Add buy button
         const buyButton = new ButtonBuilder()
           .setCustomId(`buy_${categoryKey}`)
@@ -766,6 +766,84 @@ client.on(Events.MessageCreate, async message => {
 
     await message.reply({ embeds: [resultEmbed] });
   }
+
+  // Command to add a product
+  if (message.content.toLowerCase().startsWith('!addproduct')) {
+      const member = message.guild.members.cache.get(message.author.id);
+
+      if (!hasAdminPermissions(message.author.id, member)) {
+          return message.reply('❌ Only authorized staff can use this command!');
+      }
+
+      const args = message.content.split(' ');
+      if (args.length !== 7) {
+          return message.reply('❌ Usage: !addproduct (gamepass link) (product name) (product class like steal a brainrot or grow a garden) (price usd) (price robux) (emoji)');
+      }
+
+      const gamepassLink = args[1];
+      const productName = args[2];
+      const productClass = args[3];
+      const priceUsd = parseFloat(args[4]);
+      const priceRobux = parseInt(args[5]);
+      const emoji = args[6];
+
+      if (isNaN(priceUsd) || isNaN(priceRobux)) {
+          return message.reply('❌ Price USD and Price Robux must be valid numbers!');
+      }
+
+      if (!BAZAAR_CATEGORIES[productClass]) {
+          return message.reply('❌ Invalid product class! Available classes: steal_brainrot, grow_garden, accounts');
+      }
+
+      const logChannel = client.channels.cache.get(SPENDING_LOG_CHANNEL_ID); // Or another appropriate log channel
+      if (!logChannel) {
+          return message.reply('❌ Logging channel not found!');
+      }
+
+      const newProduct = {
+          name: productName,
+          emoji: emoji,
+          price_usd: priceUsd,
+          price_robux: priceRobux,
+          gamepass: gamepassLink
+      };
+
+      // Log the new product
+      logChannel.send(`New product added:\nName: ${productName}\nClass: ${productClass}\nUSD: ${priceUsd}\nRobux: ${priceRobux}\nGamepass: ${gamepassLink}\nEmoji: ${emoji}`);
+
+      message.reply(`✅ Product "${productName}" added to "${productClass}"!`);
+  }
+
+  // Command to remove a product
+  if (message.content.toLowerCase().startsWith('!removeproduct')) {
+      const member = message.guild.members.cache.get(message.author.id);
+
+      if (!hasAdminPermissions(message.author.id, member)) {
+          return message.reply('❌ Only authorized staff can use this command!');
+      }
+
+      const args = message.content.split(' ');
+      if (args.length !== 3) {
+          return message.reply('❌ Usage: !removeproduct (product name) (product class)');
+      }
+
+      const productName = args[1];
+      const productClass = args[2];
+
+      if (!BAZAAR_CATEGORIES[productClass]) {
+          return message.reply('❌ Invalid product class! Available classes: steal_brainrot, grow_garden, accounts');
+      }
+
+      const logChannel = client.channels.cache.get(SPENDING_LOG_CHANNEL_ID); // Or another appropriate log channel
+      if (!logChannel) {
+          return message.reply('❌ Logging channel not found!');
+      }
+
+      // Log the product removal
+      logChannel.send(`Product "${productName}" removed from "${productClass}".`);
+
+      message.reply(`✅ Product "${productName}" removed from "${productClass}"!`);
+  }
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -773,7 +851,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.customId === 'select_accounts_product') {
       const userId = interaction.user.id;
       const selectedProduct = interaction.values[0];
-      const product = ACCOUNTS_PRODUCTS[selectedProduct];
+      const product = getAllProductsForCategory('accounts')[selectedProduct];
 
       if (!product) {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
@@ -837,7 +915,7 @@ client.on(Events.InteractionCreate, async interaction => {
     } else if (interaction.customId === 'select_steal_brainrot_product') {
       const userId = interaction.user.id;
       const selectedProduct = interaction.values[0];
-      const product = STEAL_BRAINROT_PRODUCTS[selectedProduct];
+      const product = getAllProductsForCategory('steal_brainrot')[selectedProduct];
 
       if (!product) {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
@@ -901,7 +979,7 @@ client.on(Events.InteractionCreate, async interaction => {
     } else if (interaction.customId === 'select_grow_garden_product') {
       const userId = interaction.user.id;
       const selectedProduct = interaction.values[0];
-      const product = GROW_GARDEN_PRODUCTS[selectedProduct];
+      const product = getAllProductsForCategory('grow_garden')[selectedProduct];
 
       if (!product) {
         return interaction.reply({ content: '❌ Product not found!', flags: 64 });
@@ -963,14 +1041,14 @@ client.on(Events.InteractionCreate, async interaction => {
         components: [actionRow]
       });
     }
-    
+
     return;
   }
   if (interaction.isButton()) {
     if (interaction.customId.startsWith('redirect_')) {
       const category = interaction.customId.replace('redirect_', '');
       const categoryInfo = BAZAAR_CATEGORIES[category];
-      
+
       if (categoryInfo && categoryInfo.thread_id) {
         await interaction.reply({ 
           content: `🔗 Check out our ${categoryInfo.name} products here: <#${categoryInfo.thread_id}>`, 
@@ -990,7 +1068,7 @@ client.on(Events.InteractionCreate, async interaction => {
       // Special handling for Grow a Garden - show product selection
       if (category === 'grow_garden') {
         const userId = interaction.user.id;
-        
+
         // Initialize empty cart for user
         userCarts.set(userId, []);
 
@@ -1007,7 +1085,8 @@ client.on(Events.InteractionCreate, async interaction => {
           .setMaxValues(1);
 
         // Add products to select menu
-        Object.entries(GROW_GARDEN_PRODUCTS).forEach(([key, product]) => {
+        const allProducts = getAllProductsForCategory('grow_garden');
+        Object.entries(allProducts).forEach(([key, product]) => {
           productSelect.addOptions({
             label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
             description: `Gamepass: ${product.gamepass}`,
@@ -1029,7 +1108,7 @@ client.on(Events.InteractionCreate, async interaction => {
       // Special handling for Accounts - show product selection
       if (category === 'accounts') {
         const userId = interaction.user.id;
-        
+
         // Initialize empty cart for user
         userCarts.set(userId, []);
 
@@ -1046,7 +1125,8 @@ client.on(Events.InteractionCreate, async interaction => {
           .setMaxValues(1);
 
         // Add products to select menu
-        Object.entries(ACCOUNTS_PRODUCTS).forEach(([key, product]) => {
+        const allProducts = getAllProductsForCategory('accounts');
+        Object.entries(allProducts).forEach(([key, product]) => {
           productSelect.addOptions({
             label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
             description: `Gamepass: ${product.gamepass}`,
@@ -1068,7 +1148,7 @@ client.on(Events.InteractionCreate, async interaction => {
       // Special handling for Steal a Brainrot - show product selection
       if (category === 'steal_brainrot') {
         const userId = interaction.user.id;
-        
+
         // Initialize empty cart for user
         userCarts.set(userId, []);
 
@@ -1085,7 +1165,8 @@ client.on(Events.InteractionCreate, async interaction => {
           .setMaxValues(1);
 
         // Add products to select menu
-        Object.entries(STEAL_BRAINROT_PRODUCTS).forEach(([key, product]) => {
+        const allProducts = getAllProductsForCategory('steal_brainrot');
+        Object.entries(allProducts).forEach(([key, product]) => {
           productSelect.addOptions({
             label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
             description: `Gamepass: ${product.gamepass}`,
@@ -1133,7 +1214,7 @@ client.on(Events.InteractionCreate, async interaction => {
       userTickets.set(userId, thread.id);
 
       let ticketDescription = `Welcome to your **${categoryInfo.name}** ticket!\n\n`;
-      
+
       switch(category) {
         case 'robux':
           ticketDescription += 'Please discuss the amount of Robux you want to buy with our staff.';
@@ -1511,7 +1592,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(GROW_GARDEN_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('grow_garden');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -1743,7 +1825,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(GROW_GARDEN_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('grow_garden');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -1770,7 +1853,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(STEAL_BRAINROT_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('steal_brainrot');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -1999,7 +2083,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(ACCOUNTS_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('accounts');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -2114,7 +2199,7 @@ client.on(Events.InteractionCreate, async interaction => {
         .setColor(BLUE_COLOR);
 
       const paymentEmbed = new EmbedBuilder()
-        .setTitle('💳 Payment Methods')
+        .setTitle('💳 PaymentMethods')
         .setDescription(
           `⚠️ Never make payment unless staff is present.\n\n` +
           `- **CashApp:** ${CASHAPP_TAG}\n` +
@@ -2231,7 +2316,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(ACCOUNTS_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('accounts');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -2261,7 +2347,8 @@ client.on(Events.InteractionCreate, async interaction => {
         .setMinValues(1)
         .setMaxValues(1);
 
-      Object.entries(STEAL_BRAINROT_PRODUCTS).forEach(([key, product]) => {
+      const allProducts = getAllProductsForCategory('steal_brainrot');
+      Object.entries(allProducts).forEach(([key, product]) => {
         productSelect.addOptions({
           label: `${product.name} - $${product.price_usd} | ${product.price_robux} Robux`,
           description: `Gamepass: ${product.gamepass}`,
@@ -2327,3 +2414,16 @@ client.once('ready', async () => {
     console.log(`✅ Ticket cleanup complete: ${activeCount} active, ${cleanedCount} cleaned`);
   }
 });
+
+function getAllProductsForCategory(category) {
+    switch (category) {
+        case 'grow_garden':
+            return GROW_GARDEN_PRODUCTS;
+        case 'steal_brainrot':
+            return STEAL_BRAINROT_PRODUCTS;
+        case 'accounts':
+            return ACCOUNTS_PRODUCTS;
+        default:
+            return {};
+    }
+}
